@@ -36,11 +36,13 @@ Otherwise, before other work, turn the request into a goal:
 - `--goal`: the outcome, in the user's words.
 - `--check "<criterion>" "<command>"`: a criterion a command proves by exiting 0, such as tests, a build, a `grep`, or a script that checks a file. Prefer these.
 - `--done "<criterion>"`: a criterion you will prove later with quoted tool output.
-- `--step`: the first few concrete actions. Steps are a plan, not a contract.
+- `--step`: the first few concrete actions. Steps are a plan, not a contract. `close` reports any left over.
 - `--non-goal`: anything you are deliberately not doing, so it is not a silent skip.
 - `--allow`: an outward or destructive action the request already approved, such as "push to branch feature/x".
 
 Use 1 to 7 criteria. Cover the failure or empty case when it matters. Do not widen the goal to have more to do.
+
+Checks run through the system shell from the goal's folder: `sh` on macOS and Linux, `cmd.exe` on Windows. On Windows, write them for cmd, or wrap them, for example `bash -c "..."` or `py -c "..."`.
 
 ```bash
 python3 "<skill folder>/scripts/goal.py" start --session "${CLAUDE_SESSION_ID}" \
@@ -80,7 +82,7 @@ Before you end any turn, read your last paragraph. If it is a plan, a question, 
 - For a criterion without one, run the tool that shows it, then `prove N "<what the tool showed>"`. Quote the output. Never prove from memory or intent.
 - When a check fails, fix the work, not the check. Never edit or delete a test or a check command to make it pass. If a test is wrong, say so with `decide` and fix it openly.
 - If the same failure repeats three times with nothing new learned, change approach: a different hypothesis, a smaller reproduction, or a fresh subagent. Run `note` with what you tried.
-- Keep check commands fast, a few minutes at most. Run a long suite once yourself and `prove` it.
+- Keep check commands fast, a few minutes at most. For a long suite, use a `--done` criterion instead: run the suite yourself, then `prove` it.
 - When there are several criteria or the result is user-facing, have a fresh subagent check each criterion against the real files and commands before you close. Tell it to report only gaps that break a criterion or the request. Fix what it finds.
 
 ## 4. Close
@@ -120,6 +122,8 @@ Running until done never overrides a refusal. Do not use a resume message to con
 In a harness without hooks, apply the same rule yourself: run `status` before you end a turn, and keep working while it says `CONTINUE`.
 
 If the user says to stop, run `stop "<their words>"`. If they change the outcome, use `criterion`, `drop N "<why>"`, or `todo`, or start a new goal.
+
+To continue a goal in a new chat (after `/clear`, or in a fresh window), run `adopt --id <goal id> --session "${CLAUDE_SESSION_ID}"`, then `status --id <goal id>` and carry on. `goal.py list` shows the live goals.
 
 ## Rules
 

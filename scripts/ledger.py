@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import time
 from datetime import datetime, timezone
@@ -162,6 +163,8 @@ def normalize(data: object) -> dict:
         "last_fingerprint": _text(data.get("last_fingerprint")),
         "created_at": _text(data.get("created_at")) or now(),
         "updated_at": _text(data.get("updated_at")) or now(),
+        # When the goal last became free for a chat to claim (start or adopt).
+        "released_at": _text(data.get("released_at")) or _text(data.get("created_at")) or now(),
     }
 
 
@@ -210,10 +213,17 @@ def verdict(ledger: dict) -> str:
     return "CONTINUE"
 
 
+def _gist(text: str | None) -> str | None:
+    # Timings and counts change on every test run; the same failure should look the same.
+    return re.sub(r"\d+", "#", text) if text else text
+
+
 def fingerprint(ledger: dict) -> str:
     payload = {
         "goal": ledger["goal"],
-        "criteria": [(c["text"], c["check"], c["ok"], c["proof"], c["last_failure"]) for c in ledger["criteria"]],
+        "criteria": [
+            (c["text"], c["check"], c["ok"], _gist(c["proof"]), _gist(c["last_failure"])) for c in ledger["criteria"]
+        ],
         "steps": ledger["steps"],
         "blocked_reason": ledger["blocked_reason"],
         "notes": ledger["notes"][-1:],
@@ -228,7 +238,7 @@ def load(path: Path) -> tuple[dict | None, str | None]:
     if not path.is_file():
         return None, None
     try:
-        return normalize(json.loads(path.read_text(encoding="utf-8"))), None
+        return normalize(json.loads(path.read_text(encoding="utf-8-sig"))), None
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         return None, str(exc)
 

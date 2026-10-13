@@ -271,6 +271,77 @@ class HookTests(unittest.TestCase):
             hook.main(["stop", "--harness", "cursor"])
         self.assertIn("followup_message", json.loads(buffer.getvalue()))
 
+    def test_new_goal_in_a_bound_chat_replaces_the_old_one(self) -> None:
+        old = self.start()
+        self.cursor("chat-a", self.transcript(f"Tracking this as goal {old}"))
+        new = self.start()
+        result = self.cursor("chat-a", self.transcript(f"Tracking this as goal {old}", f"Now goal {new}"))
+        self.assertIn(new, result["followup_message"])
+        self.assertEqual(self.stored(old)["status"], "stopped")
+        self.assertEqual(self.stored(new)["session_id"], "chat-a")
+
+    def test_unreadable_transcript_never_claims_a_stale_goal(self) -> None:
+        goal_id = self.start()
+        data = self.stored(goal_id)
+        data["released_at"] = "2020-01-01T00:00:00+00:00"
+        L.goal_path(goal_id).write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(self.cursor("chat-z"), {})
+        self.assertIsNone(self.stored(goal_id)["session_id"])
+
+    def test_unreadable_transcript_keeps_the_bound_goal(self) -> None:
+        mine = self.start("--session", "chat-a")
+        self.start()
+        self.assertIn(mine, self.cursor("chat-a")["followup_message"])
+
+    def test_adopt_moves_a_goal_to_another_chat(self) -> None:
+        goal_id = self.start("--session", "chat-a")
+        self.cli("adopt", "--id", goal_id)
+        self.assertIsNone(self.stored(goal_id)["session_id"])
+        result = self.cursor("chat-b", self.transcript(f"goal.py adopt --id {goal_id}", name="b.jsonl"))
+        self.assertIn(goal_id, result["followup_message"])
+        self.assertEqual(self.stored(goal_id)["session_id"], "chat-b")
+        self.cli("adopt", "--id", goal_id, "--session", "claude-7")
+        self.assertEqual(self.stored(goal_id)["session_id"], "claude-7")
+
+    def test_rerunning_a_failing_check_counts_as_a_stall(self) -> None:
+        goal_id = self.start("--session", "chat-a")
+        self.cli("criterion", "tests pass", "--check", "x")
+        for run in range(4):
+            data = self.stored(goal_id)
+            data["criteria"][1]["last_failure"] = f"exit 1: 1 failed in 0.{run}{run}s"
+            L.goal_path(goal_id).write_text(json.dumps(data), encoding="utf-8")
+            self.cursor("chat-a")
+        self.assertEqual(self.stored(goal_id)["stalls"], 3)
+
+    def test_context_for_a_blocked_goal_says_wait(self) -> None:
+        goal_id = self.start("--session", "claude-1")
+        self.cli("block", "needs-user: the staging password")
+        text = hook.context({"session_id": "claude-1"}, "claude")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("BLOCKED", text)
+        self.assertIn("staging password", text)
+        self.assertNotIn("Keep working", text)
+        self.assertIn(goal_id, text)
+
+    def test_windows_style_workspace_roots(self) -> None:
+        self.assertEqual(hook.local_path("/c:/Users/Jo/project"), "c:/Users/Jo/project")
+        self.assertEqual(hook.local_path("file:///c%3A/Users/Jo%20Smith/p"), "c:/Users/Jo Smith/p")
+        self.assertEqual(hook.local_path("/home/jo/project"), "/home/jo/project")
+
+    def test_naive_timestamp_does_not_break_the_hook(self) -> None:
+        self.assertNotEqual(hook.elapsed("2026-01-01T00:00:00"), "unknown")
+
+    def test_transcript_scan_finds_ids_across_chunks(self) -> None:
+        path = self.root / "long.jsonl"
+        path.write_bytes(b"x" * 50 + b"g2026-abc" + b"y" * 50)
+        with mock.patch.object(hook, "CHUNK", 7):
+            self.assertEqual(hook.transcript_mentions(str(path), ["g2026-abc", "nope"]), {"g2026-abc"})
+        self.assertIsNone(hook.transcript_mentions(str(self.root / "missing.jsonl"), ["x"]))
+
+    def test_cursor_payload_detection_ignores_environment(self) -> None:
+        with mock.patch.dict(os.environ, {"CURSOR_VERSION": "3.24"}):
+            self.assertFalse(hook.running_in_cursor({"session_id": "s", "stop_hook_active": False}))
+        self.assertTrue(hook.running_in_cursor({"conversation_id": "c"}))
+
     def stored_by_session(self, session: str) -> dict:
         return next(ledger for _, ledger, _ in L.all_goals() if ledger and ledger["session_id"] == session)
 
@@ -331,7 +402,30 @@ class InstallTests(unittest.TestCase):
 
     def test_neutral_command_has_no_quotes_without_spaces(self) -> None:
         command = install.neutral_command("/usr/bin/python3", Path("/home/me/.cursor/skills/until-done/scripts/hook.py"), "stop", "cursor")
-        self.assertEqual(command, "/usr/bin/python3 /home/me/.cursor/skills/until-done/scripts/hook.py stop --harness cursor")
+        self.assertEqual(command, "/usr/bin/python3 /home/me/.cursor/skills/until-done/scripts/hook.py stop --harness cursor --tag until-done")
+
+    def test_owner_tag_survives_short_paths(self) -> None:
+        short = "C:/Users/JOHNSM~1/.cursor/skills/UNTIL-~1/scripts/hook.py stop --harness cursor --tag until-done"
+        self.assertTrue(install.owns(short))
+        self.assertFalse(install.owns("python /home/me/babysit/tools/precommit_hook.py"))
+        self.assertTrue(install.owns("/usr/bin/python3 /Users/me/.cursor/babysit/stop_hook.py"))
+
+    def test_write_json_keeps_a_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            real = Path(folder) / "dotfiles" / "settings.json"
+            real.parent.mkdir()
+            real.write_text("{}", encoding="utf-8")
+            link = Path(folder) / "settings.json"
+            link.symlink_to(real)
+            install.write_json(link, {"hooks": {}}, dry_run=False)
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(json.loads(real.read_text(encoding="utf-8")), {"hooks": {}})
+
+    def test_read_json_accepts_a_byte_order_mark(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "hooks.json"
+            path.write_bytes(b"\xef\xbb\xbf" + b'{"version": 1}')
+            self.assertEqual(install.read_json(path), {"version": 1})
 
     def test_powershell_fallback_uses_call_operator(self) -> None:
         command = install.command_line("C:/Python313/python.exe", Path("C:/x/hook.py"), "stop", "claude", powershell=True)

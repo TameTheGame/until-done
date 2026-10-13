@@ -24,8 +24,7 @@ import sys
 from pathlib import Path
 
 NAME = "until-done"
-MARKERS = ("until-done", "babysit")  # entries this installer owns, including the old babysit hook
-HOOK_FILES = ("hook.py", "stop_hook.py")
+TAG = f"--tag {NAME}"  # hook.py ignores it; it marks entries this installer owns, even under 8.3 short paths
 CURSOR_LOOP_LIMIT = None  # no Cursor-side cap: the goal file's max_resumes is the limit
 HOOK_TIMEOUT = 30
 SKILL_FILES = ("SKILL.md", "README.md")
@@ -62,7 +61,7 @@ def short_path(path: str) -> str:
 
 
 def command_line(python: str, script: Path, mode: str, harness: str, powershell: bool = False) -> str:
-    command = f'"{portable(python)}" "{portable(script)}" {mode} --harness {harness}'
+    command = f'"{portable(python)}" "{portable(script)}" {mode} --harness {harness} {TAG}'
     return f"& {command}" if powershell else command
 
 
@@ -71,14 +70,16 @@ def neutral_command(python: str, script: Path, mode: str, harness: str) -> str:
     exe, path = portable(short_path(python)), portable(short_path(str(script)))
     if " " in exe or " " in path:
         return command_line(python, script, mode, harness, powershell=True)
-    return f"{exe} {path} {mode} --harness {harness}"
+    return f"{exe} {path} {mode} --harness {harness} {TAG}"
 
 
 def owns(command: object) -> bool:
     if not isinstance(command, str):
         return False
     lowered = command.replace("\\", "/").lower()
-    return any(marker in lowered for marker in MARKERS) and any(name in lowered for name in HOOK_FILES)
+    if TAG in lowered or ("until-done/scripts/hook.py" in lowered):
+        return True
+    return "babysit/stop_hook.py" in lowered  # the hook from the first version of this skill
 
 
 def merge_cursor(existing: dict | None, stop: str) -> dict:
@@ -138,8 +139,13 @@ def merge_claude(existing: dict | None, stop: str, context: str, shell: str | No
 def git_bash() -> bool:
     if os.name != "nt":
         return True
-    configured = os.environ.get("CLAUDE_CODE_GIT_BASH_PATH")
-    candidates = [configured] if configured else []
+    candidates = [os.environ.get("CLAUDE_CODE_GIT_BASH_PATH") or ""]
+    git = shutil.which("git")
+    if git:  # Claude Code finds bash next to git.exe: <Git>/cmd/git.exe -> <Git>/bin/bash.exe
+        candidates.append(str(Path(git).resolve().parent.parent / "bin" / "bash.exe"))
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        candidates.append(str(Path(local) / "Programs" / "Git" / "bin" / "bash.exe"))
     candidates += [r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files (x86)\Git\bin\bash.exe"]
     return any(path and Path(path).is_file() for path in candidates) or shutil.which("bash") is not None
 
@@ -163,7 +169,7 @@ def copy_skill(destination: Path, dry_run: bool) -> list[str]:
 def read_json(path: Path) -> dict | None:
     if not path.is_file():
         return None
-    text = path.read_text(encoding="utf-8")
+    text = path.read_text(encoding="utf-8-sig")
     if not text.strip():
         return None
     data = json.loads(text)
@@ -175,6 +181,7 @@ def read_json(path: Path) -> dict | None:
 def write_json(path: Path, data: dict, dry_run: bool) -> str:
     if dry_run:
         return f"would update {path}:\n{json.dumps(data, indent=2)}"
+    path = path.resolve()  # write through a symlink (dotfiles repos) instead of replacing it
     path.parent.mkdir(parents=True, exist_ok=True)
     backup = path.with_name(path.name + ".until-done.bak")
     if path.is_file() and not backup.exists():
@@ -231,7 +238,7 @@ def main(argv: list[str] | None = None) -> int:
             for line in install(harness, args.dry_run, args.uninstall):
                 sys.stdout.write(f"[{harness}] {line}\n")
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        sys.stdout.write(f"error: {exc}. Nothing else was changed.\n")
+        sys.stdout.write(f"error: {exc}. Stopped here; the lines above show what was already done.\n")
         return 1
     if not args.dry_run and not args.uninstall:
         sys.stdout.write("Done. Restart Cursor or Claude Code so they load the hooks, then try /until-done.\n")

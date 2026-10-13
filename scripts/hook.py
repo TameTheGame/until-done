@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import unquote
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -27,6 +29,8 @@ from report import record_stop  # noqa: E402
 
 SHOW_OPEN = 10
 SCAN_LIMIT = 64 * 1024 * 1024
+CHUNK = 1024 * 1024
+UNREAD_BIND_WINDOW = 30 * 60
 
 
 @dataclass
@@ -42,8 +46,12 @@ class Event:
     raw: dict = field(default_factory=dict)
 
 
+CURSOR_KEYS = ("cursor_version", "conversation_id", "generation_id", "workspace_roots")
+
+
 def running_in_cursor(payload: dict) -> bool:
-    return "cursor_version" in payload or bool(os.environ.get("CURSOR_VERSION"))
+    # Payload keys only: CURSOR_* variables leak into Claude Code started from Cursor's terminal.
+    return any(key in payload for key in CURSOR_KEYS)
 
 
 def read_event(payload: dict, harness: str | None) -> Event:
@@ -86,13 +94,21 @@ def reply(event: Event, message: str | None) -> dict:
     return {"followup_message": message}
 
 
+def local_path(root: str) -> str:
+    """Cursor on Windows can report a root as /c:/Users/... or file:///c%3A/Users/..."""
+    text = unquote(root[7:]) if root.startswith("file://") else root
+    if re.match(r"^/[A-Za-z]:[/\\]", text):
+        text = text[1:]
+    return text
+
+
 def workspace_matches(ledger: dict, roots: list[str]) -> bool:
     workspace = ledger["workspace"]
     if not workspace or not roots:
         return True
     target = Path(workspace).expanduser()
     for root in roots:
-        base = Path(root).expanduser()
+        base = Path(local_path(root)).expanduser()
         try:
             if L.same_path(str(base), str(target)):
                 return True
@@ -103,26 +119,29 @@ def workspace_matches(ledger: dict, roots: list[str]) -> bool:
     return False
 
 
-def transcript_mentions(path: str | None, needle: str) -> bool | None:
-    """True or False when the transcript could be read, None when it could not."""
-    if not path:
+def transcript_mentions(path: str | None, needles: list[str]) -> set[str] | None:
+    """Which needles the transcript contains, scanning back from the end. None if it can't be read."""
+    if not path or not needles:
         return None
-    token = needle.encode("utf-8")
-    overlap = b""
-    scanned = 0
+    tokens = {needle: needle.encode("utf-8") for needle in needles}
+    longest = max(len(token) for token in tokens.values())
+    found: set[str] = set()
     try:
         with open(path, "rb") as handle:
-            while scanned < SCAN_LIMIT:
-                chunk = handle.read(1024 * 1024)
-                if not chunk:
-                    return False
-                if token in overlap + chunk:
-                    return True
-                overlap = chunk[-len(token):]
-                scanned += len(chunk)
+            position = handle.seek(0, os.SEEK_END)
+            carry = b""
+            scanned = 0
+            while position > 0 and scanned < SCAN_LIMIT and len(found) < len(tokens):
+                size = min(CHUNK, position)
+                position -= size
+                handle.seek(position)
+                window = handle.read(size) + carry
+                found.update(needle for needle, token in tokens.items() if token in window)
+                carry = window[: longest - 1]
+                scanned += size
     except OSError:
         return None
-    return False
+    return found
 
 
 def pick_goal(event: Event) -> tuple[Path, dict] | tuple[None, None]:
@@ -135,24 +154,36 @@ def pick_goal(event: Event) -> tuple[Path, dict] | tuple[None, None]:
         return None, None
     if not event.session_id:
         return None, None
-    for path, ledger in rows:
-        if ledger["session_id"] == event.session_id and L.live(ledger):
-            return path, ledger
+    bound = next(((path, ledger) for path, ledger in rows if ledger["session_id"] == event.session_id and L.live(ledger)), None)
     unbound = [
         (path, ledger)
         for path, ledger in rows
         if ledger["session_id"] is None and ledger["status"] == "active" and workspace_matches(ledger, event.roots)
     ]
-    # Bind only the goal this chat created: its id is in this chat's transcript.
-    readable = False
-    for path, ledger in unbound:
-        seen = transcript_mentions(event.transcript_path, ledger["id"])
-        readable = readable or seen is not None
-        if seen:
-            return path, ledger
-    if not readable and len(unbound) == 1:
+    if bound:
+        # A goal this chat started or adopted after its current one replaces it.
+        unbound = [row for row in unbound if row[1]["released_at"] >= bound[1]["released_at"]]
+    if not unbound:
+        return bound or (None, None)
+    # Bind only a goal this chat mentions: its id is in this chat's transcript.
+    seen = transcript_mentions(event.transcript_path, [ledger["id"] for _, ledger in unbound])
+    if seen:
+        newest = max((row for row in unbound if row[1]["id"] in seen), key=lambda row: row[1]["released_at"])
+        return newest
+    if seen is None and bound is None and len(unbound) == 1 and released_recently(unbound[0][1]):
+        # No transcript to check (Cursor with transcripts off). Only a fresh goal is safe to guess.
         return unbound[0]
-    return None, None
+    return bound or (None, None)
+
+
+def released_recently(ledger: dict) -> bool:
+    try:
+        released = datetime.fromisoformat(ledger["released_at"])
+    except ValueError:
+        return False
+    if released.tzinfo is None:
+        released = released.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - released).total_seconds() < UNREAD_BIND_WINDOW
 
 
 def invalid_goal_for(event: Event) -> tuple[Path, str] | None:
@@ -191,6 +222,8 @@ def elapsed(since: str) -> str:
         start = datetime.fromisoformat(since)
     except ValueError:
         return "unknown"
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
     minutes = max(0, int((datetime.now(timezone.utc) - start).total_seconds() // 60))
     return f"{minutes // 60}h {minutes % 60:02d}m" if minutes >= 60 else f"{minutes}m"
 
@@ -331,12 +364,20 @@ def context(payload: dict, harness: str | None = None) -> dict:
     path, ledger = pick_goal(event)
     if ledger is None or not L.live(ledger):
         return {}
-    text = "\n".join(
-        [
-            f"An until-done goal is active in this chat. Keep working on it. CLI: {cli(ledger['id'])}",
-            *task_block(ledger),
-        ]
-    )
+    if L.verdict(ledger) == "BLOCKED":
+        text = (
+            f"Until-done goal {ledger['id']} in this chat is BLOCKED: {ledger['blocked_reason']}\n"
+            f"Wait for the user. When they answer, run `goal.py unblock --id {ledger['id']}` and continue. "
+            f"CLI: {cli(ledger['id'])}"
+        )
+    else:
+        text = "\n".join(
+            [
+                f"An until-done goal is active in this chat. Keep working on it. CLI: {cli(ledger['id'])}",
+                RULES,
+                *task_block(ledger),
+            ]
+        )
     if event.harness == "claude":
         return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}
     return {"additional_context": text}

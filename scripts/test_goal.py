@@ -208,6 +208,62 @@ class GoalCliTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("invalid", out)
 
+    def test_session_flag_without_a_value(self) -> None:
+        # Windows PowerShell 5.1 drops the empty "${CLAUDE_SESSION_ID}" argument entirely.
+        code, out = self.run_cli("start", "--session", "--goal", "x", "--done", "y")
+        self.assertEqual(code, 0, out)
+
+    def test_failing_check_reopens_a_done_goal(self) -> None:
+        marker = self.workspace / "ok"
+        marker.write_text("1", encoding="utf-8")
+        check = f'"{sys.executable}" -c "import os,sys; sys.exit(0 if os.path.exists(\'ok\') else 1)"'
+        goal_id = self.start("--check", "marker exists", check)
+        self.run_cli("prove", "1", "done")
+        self.assertTrue(self.run_cli("close")[1].startswith("DONE"))
+        marker.unlink()
+        self.run_cli("check", "--id", goal_id)
+        self.assertEqual(self.stored(goal_id)["status"], "active")
+        self.assertTrue(self.run_cli("status")[1].startswith("CONTINUE"))
+
+    def test_close_reports_leftover_steps_instead_of_blocking(self) -> None:
+        goal_id = self.start("--step", "polish the copy")
+        self.run_cli("prove", "1", "README diff shows the new section")
+        out = self.run_cli("close")[1]
+        self.assertTrue(out.startswith("DONE"), out)
+        self.assertIn("left undone (planned step): polish the copy", out)
+        self.assertEqual(self.stored(goal_id)["steps"], [])
+
+    def test_unblock_resumes_work_past_the_hard_ceiling(self) -> None:
+        goal_id = self.start()
+        data = self.stored(goal_id)
+        data.update(resumes=300, max_resumes=300, status="blocked", blocked_reason="cap: used all 300")
+        L.goal_path(goal_id).write_text(json.dumps(data), encoding="utf-8")
+        self.run_cli("unblock", "--resumes", "20")
+        saved = self.stored(goal_id)
+        self.assertEqual((saved["resumes"], saved["max_resumes"]), (0, 20))
+
+    @unittest.skipIf(os.name == "nt", "uses POSIX process groups")
+    def test_timeout_kills_the_whole_process_tree(self) -> None:
+        pid_file = self.workspace / "child.pid"
+        script = (
+            "import subprocess, sys, time; "
+            f"child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+            f"open({str(pid_file)!r}, 'w').write(str(child.pid)); time.sleep(60)"
+        )
+        code, _ = goal.run_bounded([sys.executable, "-c", script], timeout=2)
+        self.assertIsNone(code)
+        child = int(pid_file.read_text())
+        import time
+
+        for _ in range(50):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail("the grandchild survived the timeout")
+
     def test_block_kinds(self) -> None:
         self.assertEqual(L.block_kind("needs-user: the password"), "needs-user")
         self.assertEqual(L.block_kind("Destructive: delete prod table"), "destructive")

@@ -26,6 +26,8 @@ import goal, ledger as L
 mode = {mode!r}
 assert os.environ.get("UNTIL_DONE_HOOK") == "off"
 assert "-p" in sys.argv and "--extra-flag" in sys.argv
+prompt = sys.argv[sys.argv.index("-p") + 1]
+assert "\\n" not in prompt and '"' not in prompt, prompt
 goal_id = os.environ["UNTIL_DONE_GOAL"]
 data, _ = L.load(L.goal_path(goal_id))
 if mode == "work":
@@ -103,6 +105,15 @@ class SuperviseTests(unittest.TestCase):
         code, out = self.run_supervisor("work", "--runs", "1")
         self.assertEqual(code, 1)
         self.assertIn("CONTINUE", out)
+
+    @unittest.skipIf(os.name == "nt", "the fake agent relies on a shebang line")
+    def test_prompt_is_one_line_and_logs_continue(self) -> None:
+        self.run_supervisor("idle")
+        self.run_supervisor("idle", "--runs", "1")
+        folder = L.home() / "runs" / self.goal_id
+        self.assertTrue((folder / "003.log").is_file())
+        self.assertIn(self.goal_id, (folder / "prompt-001.md").read_text(encoding="utf-8"))
+        self.assertIsNone(self.stored()["session_id"])
 
     def test_missing_cli_is_reported(self) -> None:
         buffer = io.StringIO()

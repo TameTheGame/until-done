@@ -41,7 +41,7 @@ You can also just say "keep going until it's done" or "don't stop until X." In C
 
 The agent writes the goal, works it, and comes back with one of two answers:
 
-- **DONE**: what is true now, the commands that prove it, and the choices it made without asking, so you can redirect any of them.
+- **DONE**: what is true now, the commands that prove it, the choices it made without asking, and any planned steps it dropped, so you can redirect any of them.
 - **BLOCKED**: the one thing it needs from you.
 
 To steer during a run:
@@ -52,6 +52,7 @@ To steer during a run:
 | "also make it work on mobile" | `goal.py criterion "..."` |
 | "skip the docs" | `goal.py drop N "user said skip docs"` |
 | "continue" after a cap or stuck pause | `goal.py unblock --resumes 20` |
+| "pick up goal g2026… here" in a new chat | `goal.py adopt --id g2026…` |
 
 From any terminal you can run `python3 scripts/goal.py list` and `python3 scripts/goal.py show --id <id>` to see where a goal stands.
 

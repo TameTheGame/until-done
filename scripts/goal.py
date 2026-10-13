@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -103,26 +104,47 @@ def report(ledger: dict) -> str:
     return "\n".join(lines)
 
 
+def kill_tree(process: subprocess.Popen) -> None:
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)], capture_output=True, timeout=30)
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        process.kill()
+
+
+def run_bounded(command, timeout: float, cwd: str | None = None, shell: bool = False, env: dict | None = None, output=subprocess.PIPE) -> tuple[int | None, bytes]:
+    """Run a command in its own process group. On timeout kill the whole tree and return None as the code."""
+    group = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
+    process = subprocess.Popen(
+        command, shell=shell, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, **group
+    )
+    try:
+        out, _ = process.communicate(timeout=timeout)
+        return process.returncode, out or b""
+    except subprocess.TimeoutExpired:
+        kill_tree(process)
+        try:
+            out, _ = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            out = b""
+        return None, out or b""
+
+
 def run_check(command: str, cwd: str | None, timeout: int) -> tuple[bool, str]:
     folder = cwd if cwd and Path(cwd).is_dir() else None
     try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            cwd=folder,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        return False, f"timed out after {timeout}s"
+        code, raw = run_bounded(command, timeout, cwd=folder, shell=True)
     except OSError as exc:
         return False, f"could not run: {exc}"
-    output = (result.stdout + b"\n" + result.stderr).decode("utf-8", "replace")
+    output = raw.decode("utf-8", "replace")
     tail = " | ".join(line.strip() for line in output.splitlines() if line.strip())[-300:]
-    if result.returncode == 0:
+    if code is None:
+        return False, f"timed out after {timeout}s" + (f": {tail[-200:]}" if tail else "")
+    if code == 0:
         return True, f"`{command}` exited 0" + (f": {tail[-160:]}" if tail else "")
-    return False, f"exit {result.returncode}: {tail}" if tail else f"exit {result.returncode}"
+    return False, f"exit {code}: {tail}" if tail else f"exit {code}"
 
 
 def run_checks(ledger: dict, numbers: list[int], timeout: int) -> list[str]:
@@ -147,7 +169,7 @@ def criterion_number(ledger: dict, number: int) -> dict:
 def spec_from(args: argparse.Namespace) -> dict:
     spec: dict = {}
     if args.spec:
-        text = sys.stdin.read() if args.spec == "-" else Path(args.spec).read_text(encoding="utf-8")
+        text = sys.stdin.read() if args.spec == "-" else Path(args.spec).read_text(encoding="utf-8-sig")
         loaded = json.loads(text)
         if not isinstance(loaded, dict):
             raise UsageError("the spec must be a JSON object")
@@ -227,6 +249,8 @@ def cmd_check(args: argparse.Namespace) -> str:
     if not numbers:
         return "No criterion has a check command.\n" + render(ledger)
     lines = run_checks(ledger, numbers, args.timeout)
+    if ledger["status"] == "done" and L.open_items(ledger):
+        ledger["status"] = "active"
     L.save(ledger, path)
     return render(ledger) + "\n" + "\n".join(lines)
 
@@ -235,7 +259,10 @@ def cmd_close(args: argparse.Namespace) -> str:
     path, ledger = resolve(args.id)
     numbers = [i for i, c in enumerate(ledger["criteria"], 1) if c["check"]]
     lines = run_checks(ledger, numbers, args.timeout) if numbers else []
-    if not L.open_items(ledger) and not L.is_real_block(ledger["blocked_reason"]):
+    if ledger["criteria"] and not L.unproved(ledger) and not L.is_real_block(ledger["blocked_reason"]):
+        # Criteria are the contract. Steps still listed were a plan; report them instead of faking `did`.
+        ledger["decisions"].extend(f"left undone (planned step): {step}" for step in ledger["steps"])
+        ledger["steps"] = []
         ledger["status"] = "done"
         ledger["blocked_reason"] = None
     elif ledger["status"] == "done":
@@ -333,9 +360,29 @@ def cmd_unblock(args: argparse.Namespace) -> str:
     ledger["status"] = "active"
     ledger["stalls"] = 0
     if args.resumes:
-        ledger["max_resumes"] = ledger["resumes"] + args.resumes
+        ledger["resumes"] = 0
+        ledger["max_resumes"] = args.resumes
     L.save(ledger, path)
     return render(ledger)
+
+
+def cmd_adopt(args: argparse.Namespace) -> str:
+    path, ledger = resolve(args.id)
+    session = clean_session(args.session)
+    if session:
+        for other_path, other, _ in L.all_goals():
+            if other and other["id"] != ledger["id"] and L.live(other) and other["session_id"] == session:
+                other["status"] = "stopped"
+                other["notes"].append(f"replaced by {ledger['id']}")
+                L.save(other, other_path)
+    ledger["session_id"] = session
+    ledger["released_at"] = L.now()
+    if ledger["status"] == "stopped":
+        ledger["status"] = "active"
+    ledger["notes"].append("adopted by a new chat")
+    L.save(ledger, path)
+    claim = "bound to this session" if session else "free for the chat that mentions its id next"
+    return f"Adopted {ledger['id']}: {claim}.\n" + render(ledger)
 
 
 def cmd_stop(args: argparse.Namespace) -> str:
@@ -387,7 +434,7 @@ def parser() -> argparse.ArgumentParser:
     start.add_argument("--non-goal", action="append", metavar="TEXT", help="something deliberately left out")
     start.add_argument("--allow", action="append", metavar="TEXT", help="an outward or destructive action the user approved")
     start.add_argument("--max-resumes", type=int, help=f"automatic resumes before pausing (default {L.DEFAULT_MAX_RESUMES})")
-    start.add_argument("--session", help="the chat or session id, when the harness provides it")
+    start.add_argument("--session", nargs="?", help="the chat or session id, when the harness provides it")
     start.add_argument("--workspace", help="folder the checks run in (default: current folder)")
 
     add("status", cmd_status, "Print the gate: CONTINUE, DONE, BLOCKED, STOPPED, or ABSENT.")
@@ -431,6 +478,9 @@ def parser() -> argparse.ArgumentParser:
     unblock = add("unblock", cmd_unblock, "Clear a block (and optionally grant more automatic resumes).")
     unblock.add_argument("--resumes", type=int, help="allow this many more automatic resumes")
 
+    adopt = add("adopt", cmd_adopt, "Move a goal to this chat, e.g. after /clear or in a new chat. Needs --id.")
+    adopt.add_argument("--session", nargs="?", help="this chat's session id, when the harness provides it")
+
     stop = add("stop", cmd_stop, "The user ended the goal. The hook stops resuming it.")
     stop.add_argument("reason", nargs="?")
 
@@ -443,7 +493,7 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(errors="replace")
+        sys.stdout.reconfigure(errors="replace")  # a cp1252 console must not crash on a non-ASCII goal
     args = parser().parse_args(argv)
     try:
         output = args.handler(args)

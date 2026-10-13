@@ -18,13 +18,13 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
-import subprocess
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import goal as cli  # noqa: E402
 import ledger as L  # noqa: E402
 
 AGENTS = {"claude": ("claude",), "cursor": ("cursor-agent", "agent")}
@@ -39,7 +39,7 @@ def find_binary(agent: str, override: str | None) -> str | None:
     return None
 
 
-def prompt(ledger: dict, run: int) -> str:
+def instructions(ledger: dict, run: int) -> str:
     script = Path(__file__).resolve().parent / "goal.py"
     cli = f'"{sys.executable}" "{script}"'
     return "\n".join(
@@ -57,29 +57,39 @@ def prompt(ledger: dict, run: int) -> str:
     )
 
 
+def one_line_prompt(ledger: dict, run: int, folder: Path) -> str:
+    """Write the full instructions to a file and return a one-line prompt that points at it.
+
+    An npm-installed CLI on Windows is a .cmd shim, and cmd.exe cuts an argument
+    at its first newline and mangles embedded quotes, so the argv prompt has neither.
+    """
+    path = folder / f"prompt-{run:03d}.md"
+    path.write_text(instructions(ledger, run) + "\n", encoding="utf-8")
+    return (
+        f"Until-done resume, unattended run {run} on goal {ledger['id']}. "
+        f"Read the file {path.as_posix()} first and follow it exactly. Nobody can answer questions during this run."
+    )
+
+
 def run_once(command: list[str], workspace: str | None, goal_id: str, log: Path, minutes: int) -> int | None:
     env = dict(os.environ, UNTIL_DONE_GOAL=goal_id, UNTIL_DONE_HOOK="off")
-    log.parent.mkdir(parents=True, exist_ok=True)
+    folder = workspace if workspace and Path(workspace).is_dir() else None
     with log.open("wb") as handle:
         try:
-            result = subprocess.run(
-                command,
-                cwd=workspace if workspace and Path(workspace).is_dir() else None,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=handle,
-                stderr=subprocess.STDOUT,
-                timeout=minutes * 60,
-            )
-        except subprocess.TimeoutExpired:
-            return None
+            code, _ = cli.run_bounded(command, minutes * 60, cwd=folder, env=env, output=handle)
         except OSError as exc:
             handle.write(f"could not start the agent: {exc}\n".encode("utf-8"))
             return -1
-    return result.returncode
+    return code
+
+
+def next_run_number(folder: Path) -> int:
+    return len(list(folder.glob("[0-9][0-9][0-9].log"))) + 1
 
 
 def main(argv: list[str] | None = None) -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
     argv = list(sys.argv[1:] if argv is None else argv)
     extra: list[str] = []
     if "--" in argv:
@@ -94,8 +104,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-minutes", type=int, default=90, help="kill a single session after this long (default 90)")
     args = parser.parse_args(argv)
 
-    import goal as cli  # noqa: E402
-
     try:
         path, ledger = cli.resolve(args.id)
     except LookupError:
@@ -109,36 +117,51 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(f"Cannot find the {args.agent} CLI ({' or '.join(AGENTS[args.agent])}). Pass --bin.\n")
         return 2
 
+    folder = L.home() / "runs" / ledger["id"]
+    folder.mkdir(parents=True, exist_ok=True)
+    # Hold the goal while supervising so no chat in the same folder claims it.
+    claimed = ledger["session_id"] is None
+    if claimed:
+        ledger["session_id"] = f"supervise-{os.getpid()}"
+        L.save(ledger, path)
     deadline = time.monotonic() + args.hours * 3600
     unchanged = 0
-    for run in range(1, args.runs + 1):
-        word = L.verdict(ledger)
-        if word != "CONTINUE":
-            break
-        if time.monotonic() >= deadline:
-            sys.stdout.write("Time budget spent.\n")
-            break
-        before = L.fingerprint(ledger)
-        log = L.home() / "runs" / ledger["id"] / f"{run:03d}.log"
-        command = [binary, "-p", prompt(ledger, run), *extra]
-        sys.stdout.write(f"run {run}: {args.agent} (log: {log})\n")
-        sys.stdout.flush()
-        code = run_once(command, ledger["workspace"], ledger["id"], log, args.run_minutes)
-        if code is None:
-            sys.stdout.write(f"run {run}: killed after {args.run_minutes} minutes\n")
-        elif code != 0:
-            sys.stdout.write(f"run {run}: agent exited {code}\n")
-        reloaded, error = L.load(path)
-        if reloaded is None:
-            sys.stdout.write(f"The goal file is unreadable now ({error}). Stopping.\n")
-            return 1
-        ledger = reloaded
-        unchanged = unchanged + 1 if L.fingerprint(ledger) == before else 0
-        ledger["notes"].append(f"unattended run {run} ended (exit {code})")
-        L.save(ledger, path)
-        if unchanged >= NO_PROGRESS_LIMIT:
-            sys.stdout.write(f"{unchanged} runs in a row recorded no progress. Stopping. Check the logs.\n")
-            break
+    try:
+        for _ in range(args.runs):
+            if L.verdict(ledger) != "CONTINUE":
+                break
+            if time.monotonic() >= deadline:
+                sys.stdout.write("Time budget spent.\n")
+                break
+            run = next_run_number(folder)
+            before = L.fingerprint(ledger)
+            log = folder / f"{run:03d}.log"
+            command = [binary, "-p", one_line_prompt(ledger, run, folder), *extra]
+            sys.stdout.write(f"run {run}: {args.agent} (log: {log})\n")
+            sys.stdout.flush()
+            code = run_once(command, ledger["workspace"], ledger["id"], log, args.run_minutes)
+            if code is None:
+                sys.stdout.write(f"run {run}: killed after {args.run_minutes} minutes\n")
+            elif code != 0:
+                sys.stdout.write(f"run {run}: agent exited {code}\n")
+            reloaded, error = L.load(path)
+            if reloaded is None:
+                sys.stdout.write(f"The goal file is unreadable now ({error}). Stopping.\n")
+                return 1
+            ledger = reloaded
+            unchanged = unchanged + 1 if L.fingerprint(ledger) == before else 0
+            ledger["notes"].append(f"unattended run {run} ended (exit {code})")
+            L.save(ledger, path)
+            if unchanged >= NO_PROGRESS_LIMIT:
+                sys.stdout.write(f"{unchanged} runs in a row recorded no progress. Stopping. Check the logs.\n")
+                break
+    finally:
+        if claimed:
+            current, _ = L.load(path)
+            if current and current["session_id"] == f"supervise-{os.getpid()}":
+                current["session_id"] = None
+                L.save(current, path)
+                ledger = current
 
     sys.stdout.write(cli.render(ledger) + "\n")
     return 0 if L.verdict(ledger) == "DONE" else 1
