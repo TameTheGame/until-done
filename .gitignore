@@ -2,8 +2,3 @@ __pycache__/
 *.pyc
 .env
 .env.*
-active.json
-last-failure.json
-last-stop.json
-trace.jsonl
-hook-heartbeat.json

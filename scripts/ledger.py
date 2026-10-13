@@ -1,7 +1,9 @@
-"""Shared rules for the babysit goal.
+"""The goal ledger: what finished means for one until-done goal.
 
-The ledger is the record of what finished means. The stop hook and the gate
-both use it, so a turn cannot talk itself into being done.
+The CLI, the gate, and the stop hook all read the same file, so a turn
+cannot talk itself into being done. Each goal is one JSON file under
+~/.until-done/goals/ (or $UNTIL_DONE_HOME/goals/), so several chats can
+each carry their own goal at the same time.
 """
 
 from __future__ import annotations
@@ -9,144 +11,260 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
-DEFAULT_MAX_FOLLOWUPS = 24
-HARD_MAX_FOLLOWUPS = 200
+VERSION = 2
+DEFAULT_MAX_RESUMES = 40
+HARD_MAX_RESUMES = 300
+DEFAULT_MAX_STALLS = 5
+KEEP_NOTES = 40
 
-REAL_BLOCK_PREFIXES = (
-    "needs-user:",
-    "safety:",
-    "destructive:",
-    "oversight:",
-    "cap:",
-)
+# Blocks the agent may set. Anything else is a permission ask and does not stop the loop.
+AGENT_BLOCKS = ("needs-user", "destructive", "safety", "oversight")
+# Blocks only the stop hook sets.
+HOOK_BLOCKS = ("cap", "stuck")
+STATUSES = ("active", "done", "blocked", "stopped")
 
 
-def ledger_path() -> Path:
-    override = os.environ.get("BABYSIT_LEDGER")
+def now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def home() -> Path:
+    override = os.environ.get("UNTIL_DONE_HOME")
     if override:
-        return Path(override)
-    return Path.home() / ".cursor" / "babysit" / "active.json"
+        return Path(override).expanduser()
+    return Path.home() / ".until-done"
+
+
+def goals_dir() -> Path:
+    return home() / "goals"
+
+
+def goal_path(goal_id: str) -> Path:
+    return goals_dir() / f"{goal_id}.json"
+
+
+def new_id() -> str:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    return f"g{stamp}-{secrets.token_hex(3)}"
+
+
+def same_path(left: object, right: object) -> bool:
+    if not isinstance(left, str) or not isinstance(right, str) or not left or not right:
+        return False
+    try:
+        a = Path(left).expanduser().resolve()
+        b = Path(right).expanduser().resolve()
+    except OSError:
+        return False
+    if os.name == "nt":
+        return str(a).lower() == str(b).lower()
+    return a == b
+
+
+def block_kind(reason: object) -> str | None:
+    """Return the block prefix when the reason names a real block with some detail."""
+    if not isinstance(reason, str):
+        return None
+    head, sep, rest = reason.strip().partition(":")
+    kind = head.strip().lower()
+    if not sep or not rest.strip():
+        return None
+    if kind in AGENT_BLOCKS or kind in HOOK_BLOCKS:
+        return kind
+    return None
 
 
 def is_real_block(reason: object) -> bool:
-    if not isinstance(reason, str):
-        return False
-    text = reason.strip().lower()
-    return any(text.startswith(prefix) for prefix in REAL_BLOCK_PREFIXES)
+    return block_kind(reason) is not None
 
 
-def work_gaps(ledger: dict) -> list[str]:
-    evidenced = {
-        item["criterion"]
-        for item in ledger.get("evidence") or []
-        if isinstance(item, dict) and item.get("criterion") and str(item.get("proof") or "").strip()
+def _strings(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+
+def _count(value: object, default: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return default
+    return value
+
+
+def _text(value: object) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _criterion(item: object) -> dict | None:
+    if isinstance(item, str):
+        item = {"text": item}
+    if not isinstance(item, dict):
+        return None
+    text = _text(item.get("text"))
+    if text is None:
+        return None
+    proof = _text(item.get("proof"))
+    ok = item.get("ok") is True and proof is not None
+    return {
+        "text": text,
+        "check": _text(item.get("check")),
+        "ok": ok,
+        "proof": proof if ok else None,
+        "at": _text(item.get("at")) if ok else None,
+        "last_failure": None if ok else _text(item.get("last_failure")),
     }
-    gaps: list[str] = []
-    done_when = ledger.get("done_when") or []
-    if not done_when:
-        gaps.append("done_when is empty")
-    for line in done_when:
-        if line not in evidenced:
-            gaps.append(line)
-    for item in ledger.get("remaining") or []:
-        if item not in gaps:
-            gaps.append(item)
-    return gaps
+
+
+def normalize(data: object) -> dict:
+    if not isinstance(data, dict):
+        raise ValueError("the goal file is not a JSON object")
+    if data.get("version") != VERSION:
+        raise ValueError(f"version must be {VERSION}")
+    goal_id = _text(data.get("id"))
+    if goal_id is None:
+        raise ValueError("id is required")
+    goal = _text(data.get("goal"))
+    if goal is None:
+        raise ValueError("goal is required")
+    raw_criteria = data.get("criteria")
+    if not isinstance(raw_criteria, list):
+        raise ValueError("criteria must be a list")
+    criteria = [c for c in (_criterion(item) for item in raw_criteria) if c is not None]
+    status = data.get("status") or "active"
+    if status not in STATUSES:
+        raise ValueError("status must be active, done, blocked, or stopped")
+    max_resumes = _count(data.get("max_resumes"), DEFAULT_MAX_RESUMES)
+    return {
+        "version": VERSION,
+        "id": goal_id,
+        "status": status,
+        "goal": goal,
+        "workspace": _text(data.get("workspace")),
+        "harness": _text(data.get("harness")),
+        "session_id": _text(data.get("session_id")),
+        "criteria": criteria,
+        "steps": _strings(data.get("steps")),
+        "non_goals": _strings(data.get("non_goals")),
+        "authorized": _strings(data.get("authorized")),
+        "decisions": _strings(data.get("decisions")),
+        "notes": _strings(data.get("notes"))[-KEEP_NOTES:],
+        "blocked_reason": _text(data.get("blocked_reason")),
+        "max_resumes": max(1, min(HARD_MAX_RESUMES, max_resumes or DEFAULT_MAX_RESUMES)),
+        "max_stalls": max(2, _count(data.get("max_stalls"), DEFAULT_MAX_STALLS)),
+        "resumes": _count(data.get("resumes")),
+        "stalls": _count(data.get("stalls")),
+        "last_fingerprint": _text(data.get("last_fingerprint")),
+        "created_at": _text(data.get("created_at")) or now(),
+        "updated_at": _text(data.get("updated_at")) or now(),
+    }
+
+
+def unproved(ledger: dict) -> list[tuple[int, dict]]:
+    return [(index, item) for index, item in enumerate(ledger["criteria"], 1) if not item["ok"]]
+
+
+def open_items(ledger: dict) -> list[str]:
+    """Every reason the goal is not finished, as lines a person or agent can act on."""
+    items: list[str] = []
+    if not ledger["criteria"]:
+        items.append("no done-when criteria: add at least one with `goal.py criterion`")
+    for index, item in unproved(ledger):
+        line = f"[{index}] {item['text']}"
+        if item["check"]:
+            line += f"  (check: {item['check']})"
+        if item["last_failure"]:
+            line += f"  last run: {item['last_failure']}"
+        items.append(line)
+    items.extend(f"step: {step}" for step in ledger["steps"])
+    return items
+
+
+def next_action(ledger: dict) -> str:
+    if ledger["steps"]:
+        return ledger["steps"][0]
+    if not ledger["criteria"]:
+        return "add done-when criteria"
+    pending = unproved(ledger)
+    if pending:
+        index, item = pending[0]
+        if item["check"]:
+            return f"make criterion [{index}] pass, then run `goal.py check {index}`"
+        return f"satisfy criterion [{index}], then record it with `goal.py prove {index} \"<proof>\"`"
+    return "run `goal.py close` to re-run the checks and finish"
+
+
+def verdict(ledger: dict) -> str:
+    """CONTINUE, DONE, BLOCKED, or STOPPED. Only the CLI's close sets status to done."""
+    if ledger["status"] == "stopped":
+        return "STOPPED"
+    if is_real_block(ledger["blocked_reason"]):
+        return "BLOCKED"
+    if ledger["status"] == "done" and not open_items(ledger):
+        return "DONE"
+    return "CONTINUE"
 
 
 def fingerprint(ledger: dict) -> str:
     payload = {
-        "goal": ledger.get("goal"),
-        "done_when": ledger.get("done_when"),
-        "evidence": ledger.get("evidence"),
-        "remaining": ledger.get("remaining"),
-        "blocked_reason": ledger.get("blocked_reason"),
+        "goal": ledger["goal"],
+        "criteria": [(c["text"], c["check"], c["ok"], c["proof"], c["last_failure"]) for c in ledger["criteria"]],
+        "steps": ledger["steps"],
+        "blocked_reason": ledger["blocked_reason"],
+        "notes": ledger["notes"][-1:],
+        "note_count": len(ledger["notes"]),
+        "decisions": len(ledger["decisions"]),
     }
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def normalize(data: object) -> dict:
-    if not isinstance(data, dict):
-        raise ValueError("ledger is not an object")
-    if data.get("version") != 1:
-        raise ValueError("version must be 1")
-    status = data.get("status") or "active"
-    if status not in ("active", "done", "blocked"):
-        raise ValueError("status must be active, done, or blocked")
-    goal = data.get("goal")
-    if not isinstance(goal, str) or not goal.strip():
-        raise ValueError("goal is required")
-    done_when = data.get("done_when")
-    if not isinstance(done_when, list) or not all(isinstance(item, str) and item.strip() for item in done_when):
-        raise ValueError("done_when must be a list of strings")
-    remaining_raw = data.get("remaining") if isinstance(data.get("remaining"), list) else []
-    if not all(isinstance(item, str) for item in remaining_raw):
-        raise ValueError("remaining must be a list of strings")
-    evidence = []
-    for item in data.get("evidence") or []:
-        if not isinstance(item, dict):
-            continue
-        criterion = item.get("criterion")
-        proof = item.get("proof")
-        if isinstance(criterion, str) and isinstance(proof, str) and proof.strip():
-            evidence.append({"criterion": criterion, "proof": proof.strip()})
-    max_followups = data.get("max_followups", DEFAULT_MAX_FOLLOWUPS)
-    if not isinstance(max_followups, int):
-        max_followups = DEFAULT_MAX_FOLLOWUPS
-    max_followups = max(1, min(HARD_MAX_FOLLOWUPS, max_followups))
-    followups = data.get("followups") or 0
-    if not isinstance(followups, int) or followups < 0:
-        followups = 0
-    stalls = data.get("stalls") or 0
-    if not isinstance(stalls, int) or stalls < 0:
-        stalls = 0
-    blocked = data.get("blocked_reason")
-    if not isinstance(blocked, str):
-        blocked = None
-    conversation_id = data.get("conversation_id")
-    if not isinstance(conversation_id, str) or not conversation_id.strip():
-        conversation_id = None
-    workspace = data.get("workspace")
-    if not isinstance(workspace, str) or not workspace.strip():
-        workspace = None
-    last_fingerprint = data.get("last_fingerprint")
-    if not isinstance(last_fingerprint, str):
-        last_fingerprint = None
-    return {
-        "version": 1,
-        "status": status,
-        "conversation_id": conversation_id,
-        "workspace": workspace,
-        "goal": goal.strip(),
-        "done_when": [item.strip() for item in done_when],
-        "evidence": evidence,
-        "remaining": [item.strip() for item in remaining_raw if item.strip()],
-        "blocked_reason": blocked,
-        "max_followups": max_followups,
-        "followups": followups,
-        "stalls": stalls,
-        "last_fingerprint": last_fingerprint,
-    }
-
-
-def load_ledger(path: Path | None = None) -> tuple[Path, dict | None, str | None]:
-    target = path or ledger_path()
-    if not target.is_file():
-        return target, None, None
+def load(path: Path) -> tuple[dict | None, str | None]:
+    if not path.is_file():
+        return None, None
     try:
-        data = json.loads(target.read_text(encoding="utf-8"))
-        return target, normalize(data), None
-    except (OSError, json.JSONDecodeError, ValueError) as exc:
-        return target, None, str(exc)
+        return normalize(json.loads(path.read_text(encoding="utf-8"))), None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        return None, str(exc)
 
 
-def save_ledger(ledger: dict, path: Path | None = None) -> Path:
-    target = path or ledger_path()
+def save(ledger: dict, path: Path | None = None) -> Path:
+    clean = normalize(ledger)
+    clean["updated_at"] = now()
+    target = path or goal_path(clean["id"])
     target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(normalize(ledger), indent=2) + "\n", encoding="utf-8")
-    temporary.replace(target)
+    temporary = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(clean, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    # Windows refuses to replace a file another process has open, so retry briefly.
+    for attempt in range(5):
+        try:
+            temporary.replace(target)
+            break
+        except PermissionError:
+            if attempt == 4:
+                temporary.unlink(missing_ok=True)
+                raise
+            time.sleep(0.1 * (attempt + 1))
+    ledger.update(clean)
     return target
+
+
+def all_goals() -> list[tuple[Path, dict | None, str | None]]:
+    directory = goals_dir()
+    if not directory.is_dir():
+        return []
+    found = []
+    for path in directory.glob("*.json"):
+        ledger, error = load(path)
+        found.append((path, ledger, error))
+    found.sort(key=lambda row: (row[1] or {}).get("updated_at") or "", reverse=True)
+    return found
+
+
+def live(ledger: dict) -> bool:
+    return ledger["status"] in ("active", "blocked")

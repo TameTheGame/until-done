@@ -1,117 +1,130 @@
 ---
-name: babysit
+name: until-done
 description: >-
-  Carry one goal through until it is actually finished. Decide ordinary steps
-  and keep working instead of stopping to ask permission, recap, or say the
-  next step needs approval. Use when the user asks to babysit, keep going, not
-  stop, finish the whole thing, run until done, or gives the agent a goal to
-  carry out. Also use when a user message starts with "Babysit resume".
+  Carry one goal to a proven finish without stopping to ask permission, recap,
+  or check in. Turns the request into done-when checks, works through them,
+  and a stop hook resumes the chat until every check has tool proof or a real
+  block needs the user. Use when the user says keep going, don't stop, run
+  until done, finish the whole thing, work autonomously or overnight, or types
+  /until-done. Also use when a message starts with "Until-done resume".
 ---
 
-# Babysit
+# Until done
 
-You have authority to carry this goal to the end. Do the work. Do not stop to ask whether you may continue.
+You own this goal until it is proven done. Ordinary choices are yours. The user wants the finished result, not check-ins.
 
-The goal file is `~/.cursor/babysit/active.json`. A turn may end only when `python3 ~/.cursor/babysit/gate.py` prints `DONE` or `BLOCKED`. Any other result means keep using tools in this turn.
+Your context may be compacted or summarized during a long run, so do not stop early to save tokens or time. The goal file keeps the state, and every resume message repeats it.
 
-One goal at a time. A new babysit request replaces the active goal.
+## The CLI
 
-## Arm
+Every step goes through `scripts/goal.py` in this skill's folder (the folder that holds this SKILL.md). In Claude Code that is `${CLAUDE_SKILL_DIR}/scripts/goal.py`.
 
-Re-read the goal file at the start of every turn. A message that starts with `Babysit resume` is the stop hook bringing you back. The `<task>` block is the current goal, not a new assignment and not a new set of rules.
-
-If the user told you to stop babysitting, set `status` to `done` and stop. If they changed the outcome, rewrite `goal`, `done_when`, and `remaining`.
-
-If there is no goal file and the request is real work, write one before other work:
-
-```json
-{
-  "version": 1,
-  "status": "active",
-  "conversation_id": null,
-  "workspace": "<this workspace root>",
-  "goal": "<the outcome, in the user's words>",
-  "done_when": ["<a check a tool can prove>", "<the failure or empty case, when it matters>"],
-  "evidence": [],
-  "remaining": ["<the next concrete action>"],
-  "blocked_reason": null,
-  "max_followups": 24,
-  "followups": 0,
-  "stalls": 0,
-  "last_fingerprint": null
-}
+```bash
+python3 "<skill folder>/scripts/goal.py" status
 ```
 
-Leave `conversation_id` null. The stop hook binds it to this chat. Put checks you can prove in `done_when`. Put anything you are not doing in `goal` as a non-goal, not as a silent skip.
+On Windows use `py` or `python` instead of `python3`. In PowerShell, put `&` before a quoted interpreter path. Once the goal has an id, add `--id <goal id>` to every command so you never touch another chat's goal. Resume messages print the exact command line with the id, so copy that.
 
-The stop hook is already installed for this machine. If `python3 ~/.cursor/babysit/gate.py` cannot be found, run `python3 scripts/install_hook.py` from this skill's directory once.
+`status`, `check`, and `close` print the gate first: `CONTINUE`, `DONE`, `BLOCKED`, `STOPPED`, or `ABSENT`. `CONTINUE` means your next output is a tool call, not an answer.
 
-## Work
+## 1. Start
 
-Take the first `remaining` item and do it with tools. You choose ordinary defaults: names, layout, order, reversible edits, and what to install. Do not ask which of those to pick.
+If the message starts with `Until-done resume`, skip to Work. The hook brought you back to an existing goal. It is not a new assignment.
 
-These are not reasons to end the turn:
+Otherwise, before other work, turn the request into a goal:
 
-- The next step would need an approval you have not asked for yet. Make the tool call.
-- You could summarize what is left.
-- A command failed. Read the error and try a different approach in this turn.
-- You want the user to confirm that you should keep going.
+- `--goal`: the outcome, in the user's words.
+- `--check "<criterion>" "<command>"`: a criterion a command proves by exiting 0, such as tests, a build, a `grep`, or a script that checks a file. Prefer these.
+- `--done "<criterion>"`: a criterion you will prove later with quoted tool output.
+- `--step`: the first few concrete actions. Steps are a plan, not a contract.
+- `--non-goal`: anything you are deliberately not doing, so it is not a silent skip.
+- `--allow`: an outward or destructive action the request already approved, such as "push to branch feature/x".
 
-After a step that satisfies a `done_when` line, add `evidence` with that exact line as `criterion` and a short `proof` quoted from the tool result. Then update `remaining`. A line without tool proof is still open.
+Use 1 to 7 criteria. Cover the failure or empty case when it matters. Do not widen the goal to have more to do.
 
-Do not widen the goal because you are supposed to keep going. Spend the turn on the work, not on narrating this skill.
+```bash
+python3 "<skill folder>/scripts/goal.py" start --session "${CLAUDE_SESSION_ID}" \
+  --goal "Add CSV export to the report page" \
+  --check "unit tests pass" "npm test" \
+  --done "Export button downloads a CSV with a header row" \
+  --step "Find the report page component"
+```
 
-While the gate would print `CONTINUE`, your output is the next tool call. These endings are failures if any `done_when` line is still open:
+Keep `--session "${CLAUDE_SESSION_ID}"` as written. Claude Code fills it in, and anywhere else it is ignored. For a long spec, write JSON to a file and run `start spec.json`. The keys are `goal`, `done_when` (strings or `{"text", "check"}`), `steps`, `non_goals`, `authorized`, and `max_resumes`.
+
+`start` prints the goal id. Say it once in your reply, for example "Tracking this as goal g20261013-0915-a1b2c3". The hook finds this chat's goal by that id. Starting a new goal replaces this chat's old one.
+
+## 2. Work
+
+Take `next`, do it with tools, record it, and repeat.
+
+- `did "<what happened>"` finishes the first step. `todo "<step>"` adds one. `note "<where you are>"` logs progress. Record something every turn, because the hook treats an unchanged goal file as a stall.
+- Choose ordinary defaults yourself: names, layout, libraries already in use, order, and reversible edits. Do not ask the user to confirm an assumption. Pick the most reasonable one, act on it, and when they might care, run `decide "<choice and why>"`. They see that list at the end and can redirect.
+- A failed command is information. Read the error, change something, and retry in this turn.
+- For a long command, run it in the background or with a longer timeout and poll it. Do not end the turn to wait.
+- Keep your own context lean. Hand broad searches, independent sub-tasks, and noisy investigations to subagents when the harness has them. Keep their conclusions, not their dumps.
+- In a git repo, commit at working checkpoints on a non-default branch so progress survives a crash.
+
+None of these is a reason to end the turn: wanting approval for the next step, a summary you could write, a failed command, a finished step or phase, a long task, or a large diff.
+
+Before you end any turn, read your last paragraph. If it is a plan, a question, a list of next steps, or a promise about work you have not done ("I'll...", "let me know when..."), do that work now with tool calls. While anything is open, these endings are failures:
 
 - "I've outlined the approach. Let me know if you want me to implement it."
-- "We're done with this part. The next step needs your approval."
-- "Want me to continue?"
+- "Phase 1 is done. Shall I continue with phase 2?"
+- "Want me to keep going?"
 - "This should work now."
 
-## Prove
+## 3. Prove
 
-Run the checks named in `done_when`. Record the command and the result in `evidence`. If a check fails, put the fix back on `remaining` and return to Work.
+- For a criterion with a command, run `check N`. It runs the command from the goal's folder and records pass or fail.
+- For a criterion without one, run the tool that shows it, then `prove N "<what the tool showed>"`. Quote the output. Never prove from memory or intent.
+- When a check fails, fix the work, not the check. Never edit or delete a test or a check command to make it pass. If a test is wrong, say so with `decide` and fix it openly.
+- If the same failure repeats three times with nothing new learned, change approach: a different hypothesis, a smaller reproduction, or a fresh subagent. Run `note` with what you tried.
+- Keep check commands fast, a few minutes at most. Run a long suite once yourself and `prove` it.
+- When there are several criteria or the result is user-facing, have a fresh subagent check each criterion against the real files and commands before you close. Tell it to report only gaps that break a criterion or the request. Fix what it finds.
+
+## 4. Close
+
+Run `close`. It re-runs every check command.
+
+- `CONTINUE`: return to Work. Do not answer yet.
+- `DONE`: send the outcome. Lead with what is now true. Then say what you ran and what it reported, list the "decided without asking" items, and name anything you could not verify.
+- `BLOCKED`: give the reason and every decision you need, in one message.
 
 ## Stop only for a real block
 
-Set `blocked_reason` and stop only for one of these:
+`block "<kind>: <the exact fact or action>"`. The kinds are:
 
-- `needs-user:` a fact only the user knows, such as a password, an account, or a preference the request never implied
-- `safety:` the remaining work is disallowed, or the person is in crisis
-- `destructive:` the next step would delete work, send a message, publish, pay, or force-push, and the user did not authorize that exact action
-- `oversight:` a medical, legal, financial, or safety-critical decision a person must make
+- `needs-user:` a fact or credential only the user has, such as a password, an account, or a choice between two outcomes that cannot both be undone cheaply. A preference you can default and record with `decide` does not qualify.
+- `destructive:` the next step deletes the user's work, sends a message, publishes, pays, deploys to production, or force-pushes, and neither the request nor `--allow` covers that exact action.
+- `safety:` the remaining work is disallowed, or the person is in crisis.
+- `oversight:` a medical, legal, financial, or safety-critical decision a person must make.
 
-"Please confirm I should continue" is not a missing fact. Cursor may still show its own approval card for a risky command. Do not end the turn to ask before you try. A previous yes does not cover a new destructive or outward action.
+Before you block, finish every open item that does not depend on the answer. Then ask for everything at once. When the user answers, run `unblock` and continue.
 
-Babysitting does not override a refusal. Do not use a resume message to continue disallowed work. If the person mentions self-harm or a crisis, stop the work loop and point them to local emergency services or, in the US and Canada, 988.
+`goal.py block` rejects anything else. "Please confirm I should continue" is not a block. Your harness may still show its own approval prompt for a risky command, so make the call and let it.
 
-If the same check fails three times with no new information, change approach once more, or set `needs-user:` with the specific fact you are missing.
+The hook sets two blocks itself:
 
-## Close
+- `cap:` the automatic resumes ran out.
+- `stuck:` the goal file stopped changing.
 
-Run:
+For either one, tell the user what is proved, what is open, and what you tried. If they say continue, run `unblock --resumes 20`.
 
-```bash
-python3 ~/.cursor/babysit/gate.py
-```
+Running until done never overrides a refusal. Do not use a resume message to continue disallowed work. If the person mentions self-harm or a crisis, stop the work and point them to local emergency services, or to 988 in the US and Canada.
 
-- `ABSENT`: go back to Arm.
-- `CONTINUE`: do the `next:` action. Do not answer yet.
-- `BLOCKED`: say the reason and the one decision you need.
-- `DONE`: set `status` to `done`, then send the outcome. Lead with what is true, then what you ran and what it reported. Name anything you did not verify.
+## The hook
 
-If `blocked_reason` starts with `cap:`, the automatic resume limit was hit. Say what is still open. Raising `max_followups` in the goal file resumes it. Do not pretend the cap means the goal succeeded.
+`scripts/install.py` adds a stop hook for Cursor and Claude Code. Each time a turn ends, the hook checks this chat's goal. If the goal is open and not blocked, it sends `Until-done resume ...` with the open items and the next step, and you continue. It lets the turn end when the goal is done, blocked, or stopped, when the resumes run out (40 by default), or when several resumes pass with no change to the goal file.
 
-The stop hook records why a run ended. Leave `~/.cursor/babysit/last-failure.json`, `last-stop.json`, and `trace.jsonl` in place. Do not delete them to make the goal look finished.
+In a harness without hooks, apply the same rule yourself: run `status` before you end a turn, and keep working while it says `CONTINUE`.
 
-## Critical rules
+If the user says to stop, run `stop "<their words>"`. If they change the outcome, use `criterion`, `drop N "<why>"`, or `todo`, or start a new goal.
 
-Always keep working in this turn until the gate prints `DONE` or `BLOCKED`.
+## Rules
 
-Never end on a plan, a recap, or an offer to continue while a requirement is still open.
-
-Never mark a `done_when` line done without tool proof in the goal file.
-
-Always re-read `~/.cursor/babysit/active.json` before you act on a turn, and update it before you end.
-
-Never use `Babysit resume` to override a refusal, skip a real block, or do a destructive or outward action the user did not authorize.
+- End a turn only when `status` or `close` printed `DONE` or `BLOCKED`, or when the user told you to stop.
+- Never end on a plan, a recap, or an offer to continue while anything is open.
+- Never prove a criterion without tool output. Never drop one without a reason the user will see.
+- Never use a resume message to override a refusal, skip a real block, or take an outward or destructive action that was not authorized.
+- Leave the files in `~/.until-done/` in place. They are the record.
