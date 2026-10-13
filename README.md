@@ -24,7 +24,7 @@ On Windows, use `py scripts\install.py`.
 The installer does three things:
 
 - It copies the skill to `~/.cursor/skills/until-done` and/or `~/.claude/skills/until-done`.
-- It adds a stop hook to `~/.cursor/hooks.json` and/or `~/.claude/settings.json`. It also adds a hook that puts the goal back in front of the agent after the chat is compacted or resumed.
+- It adds a stop hook to `~/.cursor/hooks.json` and/or `~/.claude/settings.json`. For Claude Code it also adds a SessionStart hook that puts the goal back in front of the agent after the chat is compacted or resumed. Cursor also reads hooks from `~/.claude/settings.json`; the Claude Code entry detects that and stands down, so a resume is never counted twice.
 - It keeps every other hook and setting. The first time it changes a settings file, it saves a `.until-done.bak` copy.
 
 Restart Cursor or Claude Code afterwards. Run the installer again after you pull changes. Remove the hooks with `--uninstall`.
@@ -37,7 +37,9 @@ If you used the earlier `babysit` version, the installer replaces its Cursor hoo
 /until-done migrate the settings page to the new form library, tests green
 ```
 
-You can also just say "keep going until it's done" or "don't stop until X." The agent writes the goal, works it, and comes back with one of two answers:
+You can also just say "keep going until it's done" or "don't stop until X." In Cursor, a skill you invoke fades from context as the chat goes on. That's why every resume message restates the rules. To keep the whole skill loaded for a long run, press Option+Enter (Mac) or Alt+Enter (Windows) to run it as a Custom Mode.
+
+The agent writes the goal, works it, and comes back with one of two answers:
 
 - **DONE**: what is true now, the commands that prove it, and the choices it made without asking, so you can redirect any of them.
 - **BLOCKED**: the one thing it needs from you.
@@ -59,7 +61,7 @@ For overnight work, or anything long enough that one chat's context gets stale, 
 
 ```bash
 python3 scripts/supervise.py --agent claude -- --permission-mode auto
-python3 scripts/supervise.py --agent cursor -- --force       # only in a repo you trust
+python3 scripts/supervise.py --agent cursor -- --force --trust   # only in a repo you trust
 ```
 
 Each run starts with a fresh context, reads the goal file, does the next items, and records progress. Between runs the script checks the goal file. It stops on any of these:
@@ -111,6 +113,8 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 - **Nothing resumes in Claude Code.** Check that `~/.claude/settings.json` has the `Stop` hook and that `/hooks` lists it. Claude Code also ends a turn itself after 8 hook continuations in a row with no tool call. That only happens when the agent is replying without working, and the stall limit catches it.
 - **Windows.**
   - The installer writes the hook with the full path to the Python that ran it, so `python3` doesn't need to exist.
+  - Cursor may run hooks through PowerShell or Git Bash, which quote differently. The installer writes the Cursor hook with forward slashes and no quotes. Paths with spaces use their short 8.3 form.
   - Claude Code runs hooks through Git Bash. If Git Bash is missing, the installer writes a PowerShell form instead.
   - Check commands run through `cmd.exe`, so write them for Windows (`if exist out.txt (exit 0) else (exit 1)`), or call `py -c ...`.
-- **Claude Code `/goal`.** Claude Code has a built-in `/goal` that loops on a condition judged by a small model. It is a fine complement, but its judge can't run commands or read files. until-done's checks run real commands, work in Cursor too, and keep a record you can audit.
+- **Cursor on Windows ignores the resume.** Cursor has a known issue where a stop hook's `followup_message` is dropped on Windows. If `hook-heartbeat.json` updates but the chat doesn't continue, that's this issue. Use `supervise.py --agent cursor`, or Claude Code, until Cursor fixes it.
+- **The built-in `/goal`.** Claude Code has a built-in `/goal` that loops on a condition judged by a small model, and Cursor is rolling one out. These are fine complements, but Claude Code's judge can't run commands or read files. until-done's checks run real commands, work the same in both apps, and keep a record you can audit.

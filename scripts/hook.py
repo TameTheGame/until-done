@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Resume the chat while its until-done goal is still open.
 
-    hook.py stop --harness cursor|claude      the end-of-turn gate
-    hook.py context --harness cursor|claude   re-inject the goal after compaction
+    hook.py stop --harness cursor|claude   the end-of-turn gate
+    hook.py context --harness claude       SessionStart: re-inject the goal after compaction
 
 One script serves two harnesses:
   Cursor       stop hook  -> prints {"followup_message": ...} to continue
@@ -42,10 +42,13 @@ class Event:
     raw: dict = field(default_factory=dict)
 
 
+def running_in_cursor(payload: dict) -> bool:
+    return "cursor_version" in payload or bool(os.environ.get("CURSOR_VERSION"))
+
+
 def read_event(payload: dict, harness: str | None) -> Event:
     if harness is None:
-        claude_shape = "stop_hook_active" in payload or payload.get("hook_event_name") == "Stop"
-        harness = "claude" if claude_shape else "cursor"
+        harness = "cursor" if running_in_cursor(payload) else "claude"
     transcript = payload.get("transcript_path")
     transcript = transcript if isinstance(transcript, str) and transcript.strip() else None
     if harness == "claude":
@@ -192,12 +195,21 @@ def elapsed(since: str) -> str:
     return f"{minutes // 60}h {minutes % 60:02d}m" if minutes >= 60 else f"{minutes}m"
 
 
+RULES = (
+    "Rules: record each step with `did`, `note`, `prove N`, or `check N`. Pick reasonable defaults yourself and "
+    "log them with `decide`. Fix the work, never the checks. Before ending a turn, if your last paragraph is a plan, "
+    "a question, or a promise, do it now instead. Use `block` only for needs-user:, destructive:, safety:, or "
+    "oversight:. When nothing is open, run `close`."
+)
+
+
 def resume_message(ledger: dict, event: Event) -> str:
     lines = [
         f"Until-done resume {ledger['resumes']}/{ledger['max_resumes']}, {elapsed(ledger['created_at'])} in. "
         f"Goal {ledger['id']} is still open.",
         "Do the next step with tools now. Do not ask permission to continue and do not end on a recap or plan.",
         f"CLI: {cli(ledger['id'])}",
+        RULES,
     ]
     if event.status == "error":
         lines.append("The last turn ended with an error. Pick up from the next open step.")
@@ -229,11 +241,18 @@ def final_message(ledger: dict, why: str) -> str:
     return "\n".join(lines)
 
 
+def duplicate(payload: dict, harness: str | None) -> bool:
+    # Cursor also loads Claude Code hooks from ~/.claude/settings.json. The Cursor
+    # entry in ~/.cursor/hooks.json handles Cursor, so the Claude entry stands down
+    # there instead of counting every resume twice.
+    return harness == "claude" and running_in_cursor(payload)
+
+
 def handle(payload: dict, harness: str | None = None) -> dict:
-    event = read_event(payload, harness)
-    if os.environ.get("UNTIL_DONE_HOOK") == "off":
+    if os.environ.get("UNTIL_DONE_HOOK") == "off" or duplicate(payload, harness):
         # supervise.py runs each session once and does the looping itself.
         return {}
+    event = read_event(payload, harness)
 
     def finish(decision: str, message: str | None = None, ledger: dict | None = None, error: str | None = None) -> dict:
         result = reply(event, message)
@@ -306,6 +325,8 @@ def handle(payload: dict, harness: str | None = None) -> dict:
 
 def context(payload: dict, harness: str | None = None) -> dict:
     """After compaction or a resumed session, put this chat's goal back in front of the agent."""
+    if duplicate(payload, harness):
+        return {}
     event = read_event(payload, harness)
     path, ledger = pick_goal(event)
     if ledger is None or not L.live(ledger):
@@ -329,7 +350,7 @@ def main(argv: list[str] | None = None) -> int:
         index = args.index("--harness")
         harness = args[index + 1] if index + 1 < len(args) else None
     harness = harness if harness in ("cursor", "claude") else None
-    raw = sys.stdin.buffer.read().decode("utf-8", "replace")
+    raw = sys.stdin.buffer.read().decode("utf-8-sig", "replace")
     try:
         payload = json.loads(raw) if raw.strip() else {}
     except json.JSONDecodeError:

@@ -246,6 +246,34 @@ class HookTests(unittest.TestCase):
         self.assertEqual(report.classify_quit("I've outlined the approach. Next steps are below."), "recap")
         self.assertEqual(report.classify_quit(""), "unknown")
 
+    def test_claude_entry_stands_down_inside_cursor(self) -> None:
+        self.start("--session", "chat-a")
+        payload = {"status": "completed", "conversation_id": "chat-a", "cursor_version": "3.24.1", "loop_count": 0}
+        self.assertEqual(hook.handle(payload, "claude"), {})
+        self.assertEqual(self.stored_by_session("chat-a")["resumes"], 0)
+        self.assertIn("followup_message", hook.handle(payload, "cursor"))
+        self.assertEqual(self.stored_by_session("chat-a")["resumes"], 1)
+
+    def test_payload_with_cursor_version_is_cursor(self) -> None:
+        self.start("--session", "chat-a")
+        result = hook.handle({"status": "completed", "conversation_id": "chat-a", "cursor_version": "3.24.1"})
+        self.assertIn("followup_message", result)
+
+    def test_resume_restates_the_rules(self) -> None:
+        self.start("--session", "chat-a")
+        self.assertIn("Rules:", self.cursor("chat-a")["followup_message"])
+
+    def test_main_reads_stdin_with_byte_order_mark(self) -> None:
+        self.start("--session", "chat-a")
+        raw = b"\xef\xbb\xbf" + json.dumps({"status": "completed", "conversation_id": "chat-a"}).encode("utf-8")
+        buffer = io.StringIO()
+        with mock.patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(raw))), redirect_stdout(buffer):
+            hook.main(["stop", "--harness", "cursor"])
+        self.assertIn("followup_message", json.loads(buffer.getvalue()))
+
+    def stored_by_session(self, session: str) -> dict:
+        return next(ledger for _, ledger, _ in L.all_goals() if ledger and ledger["session_id"] == session)
+
     def test_main_prints_json_only(self) -> None:
         buffer = io.StringIO()
         with mock.patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"not json"))), redirect_stdout(buffer):
@@ -269,16 +297,15 @@ class InstallTests(unittest.TestCase):
                 },
             },
             STOP,
-            CONTEXT,
         )
         self.assertEqual(merged["hooks"]["sessionStart"][0]["command"], "echo hi")
         stops = [entry["command"] for entry in merged["hooks"]["stop"]]
         self.assertEqual(stops, ["other", STOP])
         self.assertEqual(merged["hooks"]["stop"][-1]["loop_limit"], install.CURSOR_LOOP_LIMIT)
-        again = install.merge_cursor(merged, STOP2, CONTEXT)
+        again = install.merge_cursor(merged, STOP2)
         self.assertEqual([entry["command"] for entry in again["hooks"]["stop"]], ["other", STOP2])
-        self.assertEqual([entry["command"] for entry in again["hooks"]["sessionStart"]], ["echo hi", CONTEXT])
-        removed = install.merge_cursor(again, "", "")
+        self.assertEqual([entry["command"] for entry in again["hooks"]["sessionStart"]], ["echo hi"])
+        removed = install.merge_cursor(again, "")
         self.assertEqual(removed["hooks"], {"sessionStart": [{"command": "echo hi"}], "stop": [{"command": "other"}]})
 
     def test_claude_merge_keeps_other_settings(self) -> None:
@@ -297,6 +324,14 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(len(again["hooks"]["SessionStart"]), 1)
         removed = install.merge_claude(again, "", "")
         self.assertEqual(removed["hooks"], existing["hooks"])
+
+    def test_cursor_merge_removes_an_old_context_hook(self) -> None:
+        merged = install.merge_cursor({"version": 1, "hooks": {"sessionStart": [{"command": CONTEXT}]}}, STOP)
+        self.assertNotIn("sessionStart", merged["hooks"])
+
+    def test_neutral_command_has_no_quotes_without_spaces(self) -> None:
+        command = install.neutral_command("/usr/bin/python3", Path("/home/me/.cursor/skills/until-done/scripts/hook.py"), "stop", "cursor")
+        self.assertEqual(command, "/usr/bin/python3 /home/me/.cursor/skills/until-done/scripts/hook.py stop --harness cursor")
 
     def test_powershell_fallback_uses_call_operator(self) -> None:
         command = install.command_line("C:/Python313/python.exe", Path("C:/x/hook.py"), "stop", "claude", powershell=True)

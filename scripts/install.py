@@ -8,9 +8,10 @@
     python3 scripts/install.py --uninstall  remove the hooks (skill copies stay)
 
 It copies the skill to ~/.cursor/skills/until-done and/or
-~/.claude/skills/until-done, then points a stop hook (and a hook that
-re-injects the goal after compaction) at that copy. Other hooks and settings
-are kept. The first write to a settings file leaves a .until-done.bak copy.
+~/.claude/skills/until-done, then points a stop hook at that copy. Claude Code
+also gets a SessionStart hook that re-injects the goal after compaction.
+Other hooks and settings are kept. The first write to a settings file leaves
+a .until-done.bak copy.
 """
 
 from __future__ import annotations
@@ -45,9 +46,32 @@ def portable(path: Path | str) -> str:
     return Path(path).as_posix() if os.name == "nt" else str(path)
 
 
+def short_path(path: str) -> str:
+    """On Windows, the 8.3 form of a path with spaces, so it needs no quotes."""
+    if os.name != "nt" or " " not in path:
+        return path
+    try:
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(32768)
+        if ctypes.windll.kernel32.GetShortPathNameW(path, buffer, len(buffer)):
+            return buffer.value
+    except (AttributeError, OSError):
+        pass
+    return path
+
+
 def command_line(python: str, script: Path, mode: str, harness: str, powershell: bool = False) -> str:
     command = f'"{portable(python)}" "{portable(script)}" {mode} --harness {harness}'
     return f"& {command}" if powershell else command
+
+
+def neutral_command(python: str, script: Path, mode: str, harness: str) -> str:
+    """A command that PowerShell, cmd, and Git Bash all parse the same way: no quotes when possible."""
+    exe, path = portable(short_path(python)), portable(short_path(str(script)))
+    if " " in exe or " " in path:
+        return command_line(python, script, mode, harness, powershell=True)
+    return f"{exe} {path} {mode} --harness {harness}"
 
 
 def owns(command: object) -> bool:
@@ -57,10 +81,11 @@ def owns(command: object) -> bool:
     return any(marker in lowered for marker in MARKERS) and any(name in lowered for name in HOOK_FILES)
 
 
-def merge_cursor(existing: dict | None, stop: str, context: str) -> dict:
+def merge_cursor(existing: dict | None, stop: str) -> dict:
     document = dict(existing) if isinstance(existing, dict) else {}
     hooks = dict(document.get("hooks")) if isinstance(document.get("hooks"), dict) else {}
-    for event, command in (("stop", stop), ("sessionStart", context)):
+    # sessionStart only fires for a new chat, which has no goal yet, so Cursor gets no context hook.
+    for event, command in (("stop", stop), ("sessionStart", "")):
         entries = hooks.get(event) if isinstance(hooks.get(event), list) else []
         kept = [entry for entry in entries if not (isinstance(entry, dict) and owns(entry.get("command")))]
         if command:
@@ -168,9 +193,13 @@ def install(harness: str, dry_run: bool, uninstall: bool) -> list[str]:
         lines += copy_skill(target, dry_run)
     if harness == "cursor":
         settings = Path.home() / ".cursor" / "hooks.json"
-        stop = "" if uninstall else command_line(sys.executable, script, "stop", "cursor")
-        context = "" if uninstall else command_line(sys.executable, script, "context", "cursor")
-        lines.append(write_json(settings, merge_cursor(read_json(settings), stop, context), dry_run))
+        if uninstall:
+            stop = ""
+        elif os.name == "nt":
+            stop = neutral_command(sys.executable, script, "stop", "cursor")
+        else:
+            stop = command_line(sys.executable, script, "stop", "cursor")
+        lines.append(write_json(settings, merge_cursor(read_json(settings), stop), dry_run))
         old = Path.home() / ".cursor" / "skills" / "babysit"
         if old.is_dir():
             lines.append(f"note: the old skill at {old} gives conflicting instructions. Delete it when you are ready.")
